@@ -1,0 +1,13 @@
+# Binarios compilados — se publican como GitHub Releases, no van en el tree
+scutumd
+scutumd-run
+scutumd-g
+libEGL.so
+libGLESv2.so
+libcrashisolate.so
+test_egl
+test_gl
+# Intermedios de build
+*.o
+*.a
+*.log
