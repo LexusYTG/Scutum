@@ -1,10 +1,19 @@
-# Binarios compilados — se publican como GitHub Releases
+# Binarios compilados — se publican como GitHub Releases, no van en el tree
 /glibc/libEGL.so
 /glibc/libGLESv2.so
+/glibc/test_egl
+/glibc/test_gl
 /bionic/scutumd
+/bionic/scutumd-g
 /bionic/libcrashisolate.so
+# Por si quedan en el root
+/libEGL.so
+/libGLESv2.so
 /test_egl
 /test_gl
+/scutumd
+/scutumd-g
+/libcrashisolate.so
 *.o
 *.a
 *.log
