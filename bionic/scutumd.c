@@ -1548,7 +1548,9 @@ static int present_ahb(uint32_t pw, uint32_t ph, uint8_t *out, int pst) {
                 && g_ahb.getbuf && g_ahb.mkimg && g_ahb.destroyimg && p_glEGLImageTargetTexture2DOES;
         if (!g_ahb.ok) ERR("[scutumd] present AHB no disponible (libs/extensiones faltan), uso readback directo\n");
     }
-    if (!g_ahb.ok) return 0;
+    if (!g_ahb.ok) return 0;        /* sticky-off: si ya fallo, no reintentar en esta sesion. */
+        if (!g_ahb.ok && g_ahb.tried) return 0;
+
 
     void *cc = ((void*(*)(void))p_eglGetCurrentContext)();
     if (g_ahb.buf && (g_ahb.ctx != cc || g_ahb.w != pw || g_ahb.h != ph)) ahb_teardown();
@@ -1569,7 +1571,13 @@ static int present_ahb(uint32_t pw, uint32_t ph, uint8_t *out, int pst) {
                                 0x3140 /*EGL_NATIVE_BUFFER_ANDROID*/, cb, attr);
         if (!g_ahb.img) {
             ERR("[scutumd] eglCreateImageKHR(AHB) fallo (eglGetError=0x%x) -> readback directo\n", (unsigned)((EGLint(*)(void))p_eglGetError)());
-            g_ahb.release(g_ahb.buf); g_ahb.buf = NULL; g_ahb.ok = 0; return 0;
+            /* NO liberar el AHB aca. El destructor del RefBase de Android
+             * (libutils.so, decStrong) crashea con SIGSEGV cuando el AHB
+             * nunca se enlazo bien a un EGLImage. Eso corrompe la libEGL
+             * de Android de forma irreversible y todas las operaciones EGL
+             * posteriores fallan -> RE no crea surface. El AHB se libera
+             * solo cuando el fd subyacente se cierra. */
+            g_ahb.buf = NULL; g_ahb.ok = 0; return 0;
         }
         GLint ptex = 0, pdraw = 0, pread = 0;
         ((fn_geti)p_glGetIntegerv)(0x8069 /*TEXTURE_BINDING_2D*/, &ptex);
@@ -1587,7 +1595,8 @@ static int present_ahb(uint32_t pw, uint32_t ph, uint8_t *out, int pst) {
         ((fn_bindfb)p_glBindFramebuffer)(0x8CA8, (GLuint)pread);
         if (st != 0x8CD5 /*FRAMEBUFFER_COMPLETE*/) {
             ERR("[scutumd] FBO sobre AHB incompleto (0x%x) -> readback directo\n", (unsigned)st);
-            ahb_teardown(); g_ahb.ok = 0; return 0;
+            /* mismo motivo que arriba: no liberar nada, Android limpia por fd. */
+            g_ahb.buf = NULL; g_ahb.img = NULL; g_ahb.ok = 0; return 0;
         }
         g_ahb.ctx = cc; g_ahb.w = pw; g_ahb.h = ph;
         ERR("[scutumd] present por AHardwareBuffer activo: %ux%u stride=%u px\n", pw, ph, g_ahb.stride_px);
