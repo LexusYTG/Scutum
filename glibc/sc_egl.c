@@ -354,33 +354,6 @@ const char *eglQueryString(EGLDisplay dpy, EGLint name) {
     uint32_t len;
     memcpy(&len, buf, 4);
     if (len > got - 4) len = (uint32_t)(got - 4);
-
-    /* FILTER_EGL_ANDROID: si gl4es ve EGL_ANDROID_* en la lista de
-     * extensiones, activa "modo Android" y saltea el shim para las queries
-     * de hardware -> devuelve 0 a glGetIntegerv(MAX_*). Filtramos esas
-     * extensiones para que gl4es use el camino normal de X11/EGL. */
-    if (name == 0x3055 /* EGL_EXTENSIONS */) {
-        static __thread char filtered[4096];
-        size_t w = 0;
-        const char *s = (const char *)(buf + 4);
-        uint32_t i = 0;
-        while (i < len) {
-            uint32_t j = i;
-            while (j < len && s[j] != ' ') j++;
-            uint32_t tok_len = j - i;
-            int skip = (tok_len >= 12 && !memcmp(s + i, "EGL_ANDROID_", 12));
-            if (!skip && w + tok_len + 1 < sizeof filtered) {
-                memcpy(filtered + w, s + i, tok_len);
-                w += tok_len;
-                filtered[w++] = ' ';
-            }
-            i = j;
-            while (i < len && s[i] == ' ') i++;
-        }
-        filtered[w] = 0;
-        return sc_string_intern_slot(filtered, w, (uint32_t)name, 0);
-    }
-
     return sc_string_intern_slot(buf + 4, len, (uint32_t)name, 0);
 }
 
@@ -423,13 +396,59 @@ EGLBoolean eglGetConfigs(EGLDisplay dpy, EGLConfig *configs,
     return EGL_TRUE;
 }
 
-EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
+
+
+/* ---- SC_TRACE_EGL=1: traza de las llamadas EGL que deciden si una app puede arrancar ---- */
+static int sc_trace_egl(void) {
+    static int on = -1;
+    if (on < 0) { const char *t = getenv("SC_TRACE_EGL"); on = (t && *t == '1'); }
+    return on;
+}
+static void sc_trace_attrs(const char *who, const EGLint *a) {
+    fprintf(stderr, "[sc-egl-trace] %s attrs:", who);
+    if (!a) { fprintf(stderr, " (NULL)\n"); return; }
+    for (int i = 0; a[i] != EGL_NONE && i < 120; i += 2) fprintf(stderr, " 0x%x=0x%x", (unsigned)a[i], (unsigned)a[i + 1]);
+    fprintf(stderr, "\n");
+}
+
+/* Nuestras window surfaces son pbuffers en el daemon (ver eglCreateWindowSurface): el config
+ * elegido tiene que soportar EGL_PBUFFER_BIT ademas de lo que pida la app. Si SURFACE_TYPE no
+ * esta, el default de EGL es WINDOW_BIT. */
+/* Profundidad minima. GL4ES pide EGL_DEPTH_SIZE 16 (o nada); EGL ordena las configs con el
+ * menor depth primero, asi que Mali entrega D16 (o sin depth) y los modelos 3D salen como
+ * un amasijo de poligonos por z-fighting. SC_DEPTH_BITS=0 desactiva el ajuste. */
+static int sc_min_depth(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("SC_DEPTH_BITS"); v = e ? atoi(e) : 24; }
+    return v;
+}
+static void emit_attr_iv_pbuf(const EGLint *a, int bump) {
+    EGLint tmp[128]; int n = 0, found = 0, fdepth = 0;
+    int want_depth = bump ? sc_min_depth() : 0;
+    if (a) {
+        for (; a[n] != EGL_NONE && n < 118; n += 2) {
+            tmp[n] = a[n]; tmp[n + 1] = a[n + 1];
+            if (a[n] == EGL_SURFACE_TYPE) { tmp[n + 1] |= EGL_PBUFFER_BIT; found = 1; }
+            if (a[n] == EGL_DEPTH_SIZE) {
+                fdepth = 1;
+                if (want_depth > 0 && tmp[n + 1] < want_depth) tmp[n + 1] = want_depth;
+            }
+        }
+    }
+    if (want_depth > 0 && !fdepth) { tmp[n++] = EGL_DEPTH_SIZE; tmp[n++] = want_depth; }
+    if (!found) { tmp[n++] = EGL_SURFACE_TYPE; tmp[n++] = EGL_WINDOW_BIT | EGL_PBUFFER_BIT; }
+    tmp[n] = EGL_NONE;
+    emit_attr_iv(tmp);
+}
+
+static EGLBoolean choose_config_impl(EGLDisplay dpy, const EGLint *attrib_list,
                            EGLConfig *configs, EGLint config_size,
-                           EGLint *num_config)
+                           EGLint *num_config, int bump)
 {
+    if (sc_trace_egl()) sc_trace_attrs("eglChooseConfig pide", attrib_list);
     sc_sync_begin(SC_EGL_CHOOSE_CONFIG);
     sc_emit_u64(EH(dpy));
-    emit_attr_iv(attrib_list);
+    emit_attr_iv_pbuf(attrib_list, bump);
     sc_emit_u32((uint32_t)(config_size > 0 ? config_size : 0));
     if (sc_sync_send() != 0) return EGL_FALSE;
     if (sc_sync_result() == 0) return EGL_FALSE;
@@ -437,6 +456,7 @@ EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
     uint32_t n = 0;
     if (sc_sync_recv_bytes(&n, 4) < 4) n = 0;
     if (num_config) *num_config = (EGLint)n;
+    if (sc_trace_egl()) fprintf(stderr, "[sc-egl-trace] eglChooseConfig -> %u configs (config_size=%d)\n", n, (int)config_size);
 
     if (configs && n > 0 && config_size > 0) {
         uint32_t k = (uint32_t)config_size < n ? (uint32_t)config_size : n;
@@ -453,6 +473,20 @@ EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
         }
     }
     return EGL_TRUE;
+}
+
+EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list,
+                           EGLConfig *configs, EGLint config_size,
+                           EGLint *num_config)
+{
+    EGLint n = 0;
+    EGLBoolean ok = choose_config_impl(dpy, attrib_list, configs, config_size, &n, 1);
+    if ((!ok || n == 0) && sc_min_depth() > 0) {   /* el driver no tiene D24: pedido original */
+        n = 0;
+        ok = choose_config_impl(dpy, attrib_list, configs, config_size, &n, 0);
+    }
+    if (num_config) *num_config = n;
+    return ok;
 }
 
 EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config,
@@ -488,8 +522,11 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
     sc_emit_u64(EH(config));
     sc_emit_u64(EH(share_context));
     emit_attr_iv(attrib_list);
+    if (sc_trace_egl()) sc_trace_attrs("eglCreateContext pide", attrib_list);
     if (sc_sync_send() != 0) return EGL_NO_CONTEXT;
-    return (EGLContext)HP(sc_sync_recv_u64());
+    EGLContext cx = (EGLContext)HP(sc_sync_recv_u64());
+    if (sc_trace_egl()) fprintf(stderr, "[sc-egl-trace] eglCreateContext -> %p\n", (void *)cx);
+    return cx;
 }
 
 EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
@@ -497,7 +534,8 @@ EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
     sc_emit_u64(EH(dpy));
     sc_emit_u64(EH(ctx));
     if (sc_sync_send() != 0) return EGL_FALSE;
-    return sc_sync_result() ? EGL_TRUE : EGL_FALSE;
+    if (sc_sync_result()) { sc_ca_destroy((const void *)ctx); return EGL_TRUE; }
+    return EGL_FALSE;
 }
 
 EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
@@ -515,6 +553,7 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
         if (e && *e == '1')
             fprintf(stderr, "[sc-mc] tid=%ld draw=%p read=%p ctx=%p -> %d\n",
                     (long)syscall(SYS_gettid), (void*)draw, (void*)read, (void*)ctx, (int)okmc);
+        if (okmc) sc_ca_make_current(ctx == EGL_NO_CONTEXT ? NULL : (const void *)ctx);
         return okmc;
     }
 }
@@ -551,16 +590,24 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
                                   const EGLint *attrib_list)
 {
     (void)attrib_list;
-    /* X11 present en el shim: pbuffer del tamaño de la ventana. */
-    if (!win) return EGL_NO_SURFACE;
-    if (x_ensure() != 0) return EGL_NO_SURFACE;
+    fprintf(stderr, "[sc-egl] CWS dpy=%p cfg=%p win=0x%lx\n",
+            (void*)dpy, (void*)config, (unsigned long)(uintptr_t)win);
+    fflush(stderr);
 
+    if (!win) { fprintf(stderr, "[sc-egl] win NULL\n"); return EGL_NO_SURFACE; }
+    if (x_ensure() != 0) { fprintf(stderr, "[sc-egl] sin conexion X\n"); fflush(stderr); return EGL_NO_SURFACE; }
+
+    uint32_t w = 640, h = 480;
     xcb_get_geometry_cookie_t gck = xcb_get_geometry(g_x_conn, (xcb_window_t)(uintptr_t)win);
     xcb_get_geometry_reply_t *geo = xcb_get_geometry_reply(g_x_conn, gck, NULL);
-    if (!geo) return EGL_NO_SURFACE;
-    uint32_t w = geo->width, h = geo->height;
-    free(geo);
-    if (!w || !h) return EGL_NO_SURFACE;
+    if (geo) {
+        if (geo->width && geo->height) { w = geo->width; h = geo->height; }
+        else fprintf(stderr, "[sc-egl] geo %ux%u -> fallback %ux%u\n",
+                     geo->width, geo->height, w, h);
+        free(geo);
+    } else {
+        fprintf(stderr, "[sc-egl] xcb_get_geometry fallo -> fallback %ux%u\n", w, h);
+    }
 
     EGLint pba[8];
     int n = 0;
@@ -569,12 +616,33 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
     pba[n++] = EGL_NONE;
 
     EGLSurface surf = eglCreatePbufferSurface(dpy, config, pba);
-    if (surf == EGL_NO_SURFACE) return EGL_NO_SURFACE;
+    if (surf == EGL_NO_SURFACE) {
+        EGLint e1 = eglGetError();
+        fprintf(stderr, "[sc-egl] pbuffer con config de la app fallo err=0x%x\n", (unsigned)e1);
+        EGLint ca[] = {
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+            EGL_DEPTH_SIZE, 16,
+            EGL_NONE
+        };
+        EGLConfig cfg = 0; EGLint nn = 0;
+        if (eglChooseConfig(dpy, ca, &cfg, 1, &nn) && nn && cfg) {
+            surf = eglCreatePbufferSurface(dpy, cfg, pba);
+            fprintf(stderr, "[sc-egl] retry -> surf=%p err=0x%x\n",
+                    (void*)surf, (unsigned)eglGetError());
+        }
+        if (surf == EGL_NO_SURFACE) { fflush(stderr); return EGL_NO_SURFACE; }
+    }
 
     if (ws_register((uint64_t)(uintptr_t)surf, (xcb_window_t)(uintptr_t)win, w, h) != 0) {
         eglDestroySurface(dpy, surf);
+        fprintf(stderr, "[sc-egl] ws_register fallo\n");
+        fflush(stderr);
         return EGL_NO_SURFACE;
     }
+    fprintf(stderr, "[sc-egl] OK surf=%p %ux%u\n", (void*)surf, w, h);
+    fflush(stderr);
     return surf;
 }
 
@@ -777,7 +845,10 @@ EGLBoolean eglBindAPI(EGLenum api) {
     sc_sync_begin(SC_EGL_BIND_API);
     sc_emit_u32((uint32_t)api);
     if (sc_sync_send() != 0) return EGL_FALSE;
-    return sc_sync_result() ? EGL_TRUE : EGL_FALSE;
+    EGLBoolean r = sc_sync_result() ? EGL_TRUE : EGL_FALSE;
+    if (sc_trace_egl()) fprintf(stderr, "[sc-egl-trace] eglBindAPI(0x%x) -> %d%s\n", (unsigned)api, (int)r,
+                                 api == 0x30A2 ? "  (EGL_OPENGL_API: Mali no lo soporta)" : "");
+    return r;
 }
 
 EGLenum eglQueryAPI(void) {

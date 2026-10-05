@@ -497,17 +497,22 @@ static int32_t exec_gl_one(uint32_t op, struct rd *r, struct wr *w) {
     case SC_GL_glCompileShader: {
         ARG_U32(r,u0);
         ((void(*)(GLuint))p_glCompileShader)(u0);
-        /* DIAG: loguear fallas de compilación con log real de Mali + fuente */
-        GLint ok = 1, srclen = 0;
-        ((void(*)(GLuint,GLenum,GLint*))p_glGetShaderiv)(u0, 0x8B81 /*COMPILE_STATUS*/, &ok);
-        if (!ok) {
-            char log[4096] = {0}; GLsizei ll = 0;
-            ((void(*)(GLuint,GLsizei,GLsizei*,GLchar*))p_glGetShaderInfoLog)(u0, sizeof log - 1, &ll, log);
-            ((void(*)(GLuint,GLenum,GLint*))p_glGetShaderiv)(u0, 0x8B88 /*SOURCE_LENGTH*/, &srclen);
-            char src[600] = {0}; GLsizei sl = 0;
-            ((void(*)(GLuint,GLsizei,GLsizei*,GLchar*))p_glGetShaderSource)(u0, sizeof src - 1, &sl, src);
-            ERR("[scutumd] COMPILE FAIL shader=%u srclen=%d loglen=%d\n--- log ---\n%s\n--- src head ---\n%s\n-----\n",
-                u0, srclen, (int)ll, log, src);
+        /* Chequeo sincronico post-compile: solo con SCUTUM_CHECK_PROGRAMS=1.
+         * Dos round-trips extra por shader matan el arranque de STK. */
+        static int chk_prog = -1;
+        if (chk_prog < 0) { const char *e = getenv("SCUTUM_CHECK_PROGRAMS"); chk_prog = (e && *e == '1'); }
+        if (chk_prog) {
+            GLint ok = 1, srclen = 0;
+            ((void(*)(GLuint,GLenum,GLint*))p_glGetShaderiv)(u0, 0x8B81 /*COMPILE_STATUS*/, &ok);
+            if (!ok) {
+                char log[4096] = {0}; GLsizei ll = 0;
+                ((void(*)(GLuint,GLsizei,GLsizei*,GLchar*))p_glGetShaderInfoLog)(u0, sizeof log - 1, &ll, log);
+                ((void(*)(GLuint,GLenum,GLint*))p_glGetShaderiv)(u0, 0x8B88 /*SOURCE_LENGTH*/, &srclen);
+                char src2[600] = {0}; GLsizei sl = 0;
+                ((void(*)(GLuint,GLsizei,GLsizei*,GLchar*))p_glGetShaderSource)(u0, sizeof src2 - 1, &sl, src2);
+                ERR("[scutumd] COMPILE FAIL shader=%u srclen=%d loglen=%d\n--- log ---\n%s\n--- src head ---\n%s\n-----\n",
+                    u0, srclen, (int)ll, log, src2);
+            }
         }
         return 0;
     }
@@ -608,12 +613,16 @@ static int32_t exec_gl_one(uint32_t op, struct rd *r, struct wr *w) {
     case SC_GL_glLinkProgram: {
         ARG_U32(r,u0);
         ((void(*)(GLuint))p_glLinkProgram)(u0);
-        GLint ok = 1;
-        ((void(*)(GLuint,GLenum,GLint*))p_glGetProgramiv)(u0, 0x8B82 /*LINK_STATUS*/, &ok);
-        if (!ok) {
-            char log[4096] = {0}; GLsizei ll = 0;
-            ((void(*)(GLuint,GLsizei,GLsizei*,GLchar*))p_glGetProgramInfoLog)(u0, sizeof log - 1, &ll, log);
-            ERR("[scutumd] LINK FAIL program=%u loglen=%d\n%s\n", u0, (int)ll, log);
+        static int chk_link = -1;
+        if (chk_link < 0) { const char *e = getenv("SCUTUM_CHECK_PROGRAMS"); chk_link = (e && *e == '1'); }
+        if (chk_link) {
+            GLint ok = 1;
+            ((void(*)(GLuint,GLenum,GLint*))p_glGetProgramiv)(u0, 0x8B82 /*LINK_STATUS*/, &ok);
+            if (!ok) {
+                char log[4096] = {0}; GLsizei ll = 0;
+                ((void(*)(GLuint,GLsizei,GLsizei*,GLchar*))p_glGetProgramInfoLog)(u0, sizeof log - 1, &ll, log);
+                ERR("[scutumd] LINK FAIL program=%u loglen=%d\n%s\n", u0, (int)ll, log);
+            }
         }
         return 0;
     }
@@ -811,6 +820,12 @@ static int32_t exec_gl_one(uint32_t op, struct rd *r, struct wr *w) {
                 /* la cantidad real la dicta NUM_COMPRESSED_TEXTURE_FORMATS */
                 GLint cnt = 0;
                 ((void(*)(GLenum,GLint*))p_glGetIntegerv)(GL_NUM_COMPRESSED_TEXTURE_FORMATS, &cnt);
+                if (cnt < 0) cnt = 0;
+                if (cnt > 256) cnt = 256;
+                n = (uint32_t)cnt;
+            } else if (u0 == 0x87FF /*GL_PROGRAM_BINARY_FORMATS(_OES)*/) {
+                GLint cnt = 0;
+                ((void(*)(GLenum,GLint*))p_glGetIntegerv)(0x87FE /*NUM_PROGRAM_BINARY_FORMATS*/, &cnt);
                 if (cnt < 0) cnt = 0;
                 if (cnt > 256) cnt = 256;
                 n = (uint32_t)cnt;
@@ -1691,12 +1706,13 @@ static int32_t exec_egl_one(uint32_t op, struct rd *r, struct wr *w) {
         EGLBoolean ok = ((EGLBoolean(*)(EGLDisplay,EGLConfig*,EGLint,EGLint*))p_eglGetConfigs)(
             (EGLDisplay)(uintptr_t)q0, cfgs, maxc, &nout);
         if (w) {
-            /* si el cliente pidió sólo la cantidad (maxc=0), nout viene del driver
-             * pero cfgs es NULL: no hay nada para escribir, sólo el count. */
-            EGLint n = (maxc > 0 && nout > maxc) ? maxc : nout;
-            if (!cfgs) n = 0;
+            /* count-only (maxc=0, cfgs=NULL): devolvemos el total del driver.
+             * Antes un `if (!cfgs) n = 0;` tiraba el count a 0 y gl4es no
+             * encontraba GLX visual -> RE no abria ventana. */
+            EGLint n     = (maxc > 0 && nout > maxc) ? maxc : nout;
+            EGLint nw    = cfgs ? n : 0;
             wr_u32(w, (uint32_t)n);
-            for (EGLint i = 0; i < n; i++) wr_u64(w, (uint64_t)(uintptr_t)cfgs[i]);
+            for (EGLint i = 0; i < nw; i++) wr_u64(w, (uint64_t)(uintptr_t)cfgs[i]);
         }
         free(cfgs);
         return ok ? 1 : 0;
@@ -1717,10 +1733,11 @@ static int32_t exec_egl_one(uint32_t op, struct rd *r, struct wr *w) {
         EGLBoolean ok = ((EGLBoolean(*)(EGLDisplay,const EGLint*,EGLConfig*,EGLint,EGLint*))p_eglChooseConfig)(
             (EGLDisplay)(uintptr_t)q0, attrs, cfgs, maxc, &nout);
         if (w) {
-            EGLint n = (maxc > 0 && nout > maxc) ? maxc : nout;
-            if (!cfgs) n = 0;
+            /* idem GET_CONFIGS: count-only no debe pisar el count del driver. */
+            EGLint n     = (maxc > 0 && nout > maxc) ? maxc : nout;
+            EGLint nw    = cfgs ? n : 0;
             wr_u32(w, (uint32_t)n);
-            for (EGLint i = 0; i < n; i++) wr_u64(w, (uint64_t)(uintptr_t)cfgs[i]);
+            for (EGLint i = 0; i < nw; i++) wr_u64(w, (uint64_t)(uintptr_t)cfgs[i]);
         }
         free(cfgs);
         return ok ? 1 : 0;
@@ -2039,6 +2056,10 @@ static int32_t exec_egl_one(uint32_t op, struct rd *r, struct wr *w) {
         uint32_t kind = 0;
         if ((fn = dlsym(g_gles_handle, name))) kind = 2;
         else if ((fn = dlsym(g_egl_handle, name))) kind = 1;
+        else if (!strcmp(name, "glGetProgramBinaryOES") || !strcmp(name, "glProgramBinaryOES")) {
+            /* El cliente tiene shim propio (alias del core); basta con anunciarlo. */
+            fn = (void*)p_glGetProgramBinary; kind = 2;
+        }
         if (w) {
             wr_u32(w, fn ? 1 : 0);
             wr_u32(w, kind);

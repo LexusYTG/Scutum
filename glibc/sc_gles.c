@@ -80,6 +80,37 @@
 #include "sc_core.h"
 #include "sc_gl_enum.h"
 
+/*
+ * SC_CHECK_ERR=1: tras cada draw / glBufferData / glBufferSubData hace un glGetError sincrono
+ * (lento) y escribe en stderr las llamadas que el driver rechazo. Max 400 lineas.
+ * Sirve para ver si el Mali descarta draws o subidas de buffers grandes.
+ */
+#ifdef SC_DEBUG_CHK
+static int sc_chk_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("SC_CHECK_ERR"); v = (e && *e == '1'); }
+    return v;
+}
+static void sc_chk(const char *what, long a, long b, long c, long d) {
+    static int printed;
+    if (!sc_chk_on()) return;
+    GLenum e = glGetError();
+    if (!e || printed >= 400) return;
+    printed++;
+    fprintf(stderr, "[sc-err] 0x%04x tras %s(%ld, %ld, %ld, %ld)\n", (unsigned)e, what, a, b, c, d);
+}
+#else
+/* Compilado fuera por defecto: el glGetError sincrono por draw hacia el arranque de 11 min. */
+#define sc_chk(what, a, b, c, d) ((void)0)
+#endif
+
+#ifdef SC_DEBUG_BANNER
+__attribute__((constructor))
+static void sc_build_banner(void) {
+    fprintf(stderr, "[sc-build] sc_gles %s %s\n", __DATE__, __TIME__);
+}
+#endif
+
 /* Algunos headers glibc no definen el nombre sin sufijo _OES. Mismo valor. */
 #ifndef GL_UNSIGNED_INT_10_10_10_2
 #define GL_UNSIGNED_INT_10_10_10_2 0x8DF6
@@ -143,7 +174,7 @@ static size_t sc_pixel_size(GLenum fmt, GLenum type) {
     size_t t;
     switch (type) {
     case GL_UNSIGNED_BYTE: case GL_BYTE: t = 1; break;
-    case GL_UNSIGNED_SHORT: case GL_SHORT: case GL_HALF_FLOAT: t = 2; break;
+    case GL_UNSIGNED_SHORT: case GL_SHORT: case GL_HALF_FLOAT: case 0x8D61: t = 2; break;
     case GL_UNSIGNED_INT: case GL_INT: case GL_FLOAT: t = 4; break;
     default: return 0;
     }
@@ -191,6 +222,8 @@ static void gen_ids(uint32_t op, GLsizei n, GLuint *out) {
     read_gl_ids((uint32_t)n, out);
 }
 
+#include "sc_clientarr.h"
+
 /* Lee un string con prefijo [u32 len] y copia respetando bufSize. */
 static void read_named_string(GLsizei bufSize, GLsizei *length, GLchar *dst) {
     if (bufSize < 0) bufSize = 0;
@@ -216,7 +249,7 @@ static void read_named_string(GLsizei bufSize, GLsizei *length, GLchar *dst) {
 void glActiveTexture(GLenum texture) { sc_batch_begin(SC_GL_glActiveTexture); sc_emit_u32(texture); sc_batch_end(); }
 void glAttachShader(GLuint program, GLuint shader) { sc_batch_begin(SC_GL_glAttachShader); sc_emit_u32(program); sc_emit_u32(shader); sc_batch_end(); }
 void glBindAttribLocation(GLuint program, GLuint index, const GLchar *name) { sc_batch_begin(SC_GL_glBindAttribLocation); sc_emit_u32(program); sc_emit_u32(index); sc_emit_string(name); sc_batch_end(); }
-void glBindBuffer(GLenum target, GLuint buffer) { sc_batch_begin(SC_GL_glBindBuffer); sc_emit_u32(target); sc_emit_u32(buffer); sc_batch_end(); }
+void glBindBuffer(GLenum target, GLuint buffer) { ca_on_bind_buffer(target, buffer); sc_batch_begin(SC_GL_glBindBuffer); sc_emit_u32(target); sc_emit_u32(buffer); sc_batch_end(); }
 void glBindFramebuffer(GLenum target, GLuint framebuffer) { sc_batch_begin(SC_GL_glBindFramebuffer); sc_emit_u32(target); sc_emit_u32(framebuffer); sc_batch_end(); }
 void glBindRenderbuffer(GLenum target, GLuint renderbuffer) { sc_batch_begin(SC_GL_glBindRenderbuffer); sc_emit_u32(target); sc_emit_u32(renderbuffer); sc_batch_end(); }
 void glBindTexture(GLenum target, GLuint texture) { sc_batch_begin(SC_GL_glBindTexture); sc_emit_u32(target); sc_emit_u32(texture); sc_batch_end(); }
@@ -225,8 +258,8 @@ void glBlendEquation(GLenum mode) { sc_batch_begin(SC_GL_glBlendEquation); sc_em
 void glBlendEquationSeparate(GLenum modeRGB, GLenum modeAlpha) { sc_batch_begin(SC_GL_glBlendEquationSeparate); sc_emit_u32(modeRGB); sc_emit_u32(modeAlpha); sc_batch_end(); }
 void glBlendFunc(GLenum sfactor, GLenum dfactor) { sc_batch_begin(SC_GL_glBlendFunc); sc_emit_u32(sfactor); sc_emit_u32(dfactor); sc_batch_end(); }
 void glBlendFuncSeparate(GLenum sfRGB, GLenum dfRGB, GLenum sfA, GLenum dfA) { sc_batch_begin(SC_GL_glBlendFuncSeparate); sc_emit_u32(sfRGB); sc_emit_u32(dfRGB); sc_emit_u32(sfA); sc_emit_u32(dfA); sc_batch_end(); }
-void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) { sc_batch_begin(SC_GL_glBufferData); sc_emit_u32(target); sc_emit_u64((uint64_t)size); sc_emit_bytes(data, data ? (size_t)size : 0); sc_emit_u32(usage); sc_batch_end(); }
-void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data) { sc_batch_begin(SC_GL_glBufferSubData); sc_emit_u32(target); sc_emit_u64((uint64_t)offset); sc_emit_u64((uint64_t)size); sc_emit_bytes(data, data ? (size_t)size : 0); sc_batch_end(); }
+void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) { ca_shadow_data(target, size, data); sc_batch_begin(SC_GL_glBufferData); sc_emit_u32(target); sc_emit_u64((uint64_t)size); sc_emit_bytes(data, data ? (size_t)size : 0); sc_emit_u32(usage); sc_batch_end(); sc_chk("glBufferData", (long)target, (long)size, (long)(data != NULL), (long)usage); }
+void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data) { ca_shadow_sub(target, offset, size, data); sc_batch_begin(SC_GL_glBufferSubData); sc_emit_u32(target); sc_emit_u64((uint64_t)offset); sc_emit_u64((uint64_t)size); sc_emit_bytes(data, data ? (size_t)size : 0); sc_batch_end(); sc_chk("glBufferSubData", (long)target, (long)offset, (long)size, 0); }
 void glClear(GLbitfield mask) { sc_batch_begin(SC_GL_glClear); sc_emit_u32((uint32_t)mask); sc_batch_end(); }
 void glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { sc_batch_begin(SC_GL_glClearColor); sc_emit_f32(r); sc_emit_f32(g); sc_emit_f32(b); sc_emit_f32(a); sc_batch_end(); }
 void glClearDepthf(GLfloat d) { sc_batch_begin(SC_GL_glClearDepthf); sc_emit_f32(d); sc_batch_end(); }
@@ -252,7 +285,7 @@ void glCopyTexImage2D(GLenum target, GLint level, GLenum ifmt, GLint x, GLint y,
 void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoff, GLint yoff, GLint x, GLint y, GLsizei w, GLsizei h) { sc_batch_begin(SC_GL_glCopyTexSubImage2D); sc_emit_u32(target); sc_emit_i32(level); sc_emit_i32(xoff); sc_emit_i32(yoff); sc_emit_i32(x); sc_emit_i32(y); sc_emit_i32(w); sc_emit_i32(h); sc_batch_end(); }
 void glCullFace(GLenum mode) { sc_batch_begin(SC_GL_glCullFace); sc_emit_u32(mode); sc_batch_end(); }
 
-void glDeleteBuffers(GLsizei n, const GLuint *buffers) { sc_batch_begin(SC_GL_glDeleteBuffers); emit_u32v(buffers, n); sc_batch_end(); }
+void glDeleteBuffers(GLsizei n, const GLuint *buffers) { ca_on_delete_buffers(n, buffers); sc_batch_begin(SC_GL_glDeleteBuffers); emit_u32v(buffers, n); sc_batch_end(); }
 void glDeleteFramebuffers(GLsizei n, const GLuint *fb) { sc_batch_begin(SC_GL_glDeleteFramebuffers); emit_u32v(fb, n); sc_batch_end(); }
 void glDeleteProgram(GLuint program) { sc_batch_begin(SC_GL_glDeleteProgram); sc_emit_u32(program); sc_batch_end(); }
 void glDeleteRenderbuffers(GLsizei n, const GLuint *rb) { sc_batch_begin(SC_GL_glDeleteRenderbuffers); emit_u32v(rb, n); sc_batch_end(); }
@@ -263,11 +296,23 @@ void glDepthMask(GLboolean flag) { sc_batch_begin(SC_GL_glDepthMask); sc_emit_u3
 void glDepthRangef(GLfloat n, GLfloat f) { sc_batch_begin(SC_GL_glDepthRangef); sc_emit_f32(n); sc_emit_f32(f); sc_batch_end(); }
 void glDetachShader(GLuint program, GLuint shader) { sc_batch_begin(SC_GL_glDetachShader); sc_emit_u32(program); sc_emit_u32(shader); sc_batch_end(); }
 void glDisable(GLenum cap) { sc_batch_begin(SC_GL_glDisable); sc_emit_u32(cap); sc_batch_end(); }
-void glDisableVertexAttribArray(GLuint index) { sc_batch_begin(SC_GL_glDisableVertexAttribArray); sc_emit_u32(index); sc_batch_end(); }
-void glDrawArrays(GLenum mode, GLint first, GLsizei count) { sc_batch_begin(SC_GL_glDrawArrays); sc_emit_u32(mode); sc_emit_i32(first); sc_emit_i32(count); sc_batch_end(); }
-void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) { sc_batch_begin(SC_GL_glDrawElements); sc_emit_u32(mode); sc_emit_i32(count); sc_emit_u32(type); emit_ptr(indices); sc_batch_end(); }
+void glDisableVertexAttribArray(GLuint index) { ca_on_enable(index, 0); sc_batch_begin(SC_GL_glDisableVertexAttribArray); sc_emit_u32(index); sc_batch_end(); }
+void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    sc_ca_ctx *s = ca_cur(); int ca = ca_begin(s, 0, first, count, 0, NULL, 1);
+    if (ca < 0) return;
+    sc_batch_begin(SC_GL_glDrawArrays); sc_emit_u32(mode); sc_emit_i32(first); sc_emit_i32(count); sc_batch_end();
+    ca_end(s, ca);
+    sc_chk("glDrawArrays", (long)mode, (long)first, (long)count, (long)ca);
+}
+void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
+    sc_ca_ctx *s = ca_cur(); const void *ind = indices; int ca = ca_begin(s, 1, 0, count, type, &ind, 1);
+    if (ca < 0) return;
+    sc_batch_begin(SC_GL_glDrawElements); sc_emit_u32(mode); sc_emit_i32(count); sc_emit_u32(type); emit_ptr(ind); sc_batch_end();
+    ca_end(s, ca);
+    sc_chk("glDrawElements", (long)mode, (long)count, (long)type, (long)(uintptr_t)indices);
+}
 void glEnable(GLenum cap) { sc_batch_begin(SC_GL_glEnable); sc_emit_u32(cap); sc_batch_end(); }
-void glEnableVertexAttribArray(GLuint index) { sc_batch_begin(SC_GL_glEnableVertexAttribArray); sc_emit_u32(index); sc_batch_end(); }
+void glEnableVertexAttribArray(GLuint index) { ca_on_enable(index, 1); sc_batch_begin(SC_GL_glEnableVertexAttribArray); sc_emit_u32(index); sc_batch_end(); }
 void glFinish(void) { sc_batch_flush(); sc_sync_begin(SC_GL_glFinish); sc_sync_send(); }
 void glFlush(void) { sc_batch_flush(); }
 
@@ -275,10 +320,10 @@ void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum rbtarget
 void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) { sc_batch_begin(SC_GL_glFramebufferTexture2D); sc_emit_u32(target); sc_emit_u32(attachment); sc_emit_u32(textarget); sc_emit_u32(texture); sc_emit_i32(level); sc_batch_end(); }
 void glFrontFace(GLenum mode) { sc_batch_begin(SC_GL_glFrontFace); sc_emit_u32(mode); sc_batch_end(); }
 
-void glGenBuffers(GLsizei n, GLuint *buffers)              { gen_ids(SC_GL_glGenBuffers, n, buffers); }
+void glGenBuffers(GLsizei n, GLuint *buffers) { if (ca_gen_pooled(1, SC_GL_glGenBuffers, n, buffers)) return; gen_ids(SC_GL_glGenBuffers, n, buffers); }
 void glGenFramebuffers(GLsizei n, GLuint *fb)              { gen_ids(SC_GL_glGenFramebuffers, n, fb); }
 void glGenRenderbuffers(GLsizei n, GLuint *rb)             { gen_ids(SC_GL_glGenRenderbuffers, n, rb); }
-void glGenTextures(GLsizei n, GLuint *textures)            { gen_ids(SC_GL_glGenTextures, n, textures); }
+void glGenTextures(GLsizei n, GLuint *textures) { if (ca_gen_pooled(0, SC_GL_glGenTextures, n, textures)) return; gen_ids(SC_GL_glGenTextures, n, textures); }
 void glGenQueries(GLsizei n, GLuint *ids)                  { gen_ids(SC_GL_glGenQueries, n, ids); }
 void glGenVertexArrays(GLsizei n, GLuint *va)              { gen_ids(SC_GL_glGenVertexArrays, n, va); }
 void glGenSamplers(GLsizei n, GLuint *s)                   { gen_ids(SC_GL_glGenSamplers, n, s); }
@@ -288,7 +333,16 @@ void glGenerateMipmap(GLenum target) { sc_batch_begin(SC_GL_glGenerateMipmap); s
 void glHint(GLenum target, GLenum mode) { sc_batch_begin(SC_GL_glHint); sc_emit_u32(target); sc_emit_u32(mode); sc_batch_end(); }
 void glLineWidth(GLfloat w) { sc_batch_begin(SC_GL_glLineWidth); sc_emit_f32(w); sc_batch_end(); }
 void glLinkProgram(GLuint program) { sc_batch_begin(SC_GL_glLinkProgram); sc_emit_u32(program); sc_batch_end(); }
-void glPixelStorei(GLenum pname, GLint param) { sc_batch_begin(SC_GL_glPixelStorei); sc_emit_u32(pname); sc_emit_i32(param); sc_batch_end(); }
+static __thread int g_unpack_align = 4, g_unpack_rowlen = 0;
+static size_t sc_image_bytes(GLenum fmt, GLenum type, GLsizei w, GLsizei h) {
+    size_t bpp = sc_pixel_size(fmt, type);
+    if (!bpp || w <= 0 || h <= 0) return 0;
+    size_t rl = g_unpack_rowlen > 0 ? (size_t)g_unpack_rowlen : (size_t)w;
+    size_t al = (size_t)(g_unpack_align > 0 ? g_unpack_align : 4);
+    size_t stride = ((rl * bpp + al - 1) / al) * al;
+    return (size_t)(h - 1) * stride + (size_t)w * bpp;
+}
+void glPixelStorei(GLenum pname, GLint param) { if (pname == 0x0CF5) g_unpack_align = param; else if (pname == 0x0CF2) g_unpack_rowlen = param; sc_batch_begin(SC_GL_glPixelStorei); sc_emit_u32(pname); sc_emit_i32(param); sc_batch_end(); }
 void glPolygonOffset(GLfloat factor, GLfloat units) { sc_batch_begin(SC_GL_glPolygonOffset); sc_emit_f32(factor); sc_emit_f32(units); sc_batch_end(); }
 void glReleaseShaderCompiler(void) { sc_batch_begin(SC_GL_glReleaseShaderCompiler); sc_batch_end(); }
 void glRenderbufferStorage(GLenum target, GLenum ifmt, GLsizei w, GLsizei h) { sc_batch_begin(SC_GL_glRenderbufferStorage); sc_emit_u32(target); sc_emit_u32(ifmt); sc_emit_i32(w); sc_emit_i32(h); sc_batch_end(); }
@@ -301,6 +355,43 @@ void glShaderBinary(GLsizei count, const GLuint *shaders, GLenum binaryformat, c
     sc_emit_u32(binaryformat);
     sc_emit_bytes(binary, binary ? (size_t)length : 0);
     sc_batch_end();
+}
+
+
+/*
+ * Forzar highp en shaders. gl4es genera "precision mediump float" y calificadores
+ * mediump/lowp; en Mali (Bifrost/Valhall) mediump es fp16 real: las posiciones de
+ * vertices y las matrices pierden precision -> modelos deformados y mapa que "salta".
+ * SC_HIGHP=0 desactiva. Devuelve un buffer malloc() (sin NUL) y su largo en *outn.
+ */
+static int sc_highp_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("SC_HIGHP"); v = !(e && *e == '0'); }
+    return v;
+}
+static int sc_isid(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+static char *sc_highp_rewrite(const char *s, size_t n, size_t *outn, int *nrep) {
+    char *o = (char *)malloc(n + n / 4 + 8);   /* peor caso: todo "lowp" (4) -> "highp" (5) */
+    if (!o) return NULL;
+    size_t w = 0;
+    for (size_t i = 0; i < n; ) {
+        int m = 0;
+        if ((i == 0 || !sc_isid((unsigned char)s[i - 1]))) {
+            if (i + 7 <= n && !memcmp(s + i, "mediump", 7) && (i + 7 == n || !sc_isid((unsigned char)s[i + 7]))) m = 7;
+            else if (i + 4 <= n && !memcmp(s + i, "lowp", 4) && (i + 4 == n || !sc_isid((unsigned char)s[i + 4]))) m = 4;
+        }
+        if (m) {
+            /* "highp" mide 5: mediump(7) -> "highp" + 2 espacios; lowp(4) -> no cabe, se reasigna */
+            memcpy(o + w, "highp", 5); w += 5;
+            if (m == 7) { o[w++] = ' '; o[w++] = ' '; }
+            i += (size_t)m;
+            if (nrep) (*nrep)++;
+            continue;
+        }
+        o[w++] = s[i++];
+    }
+    *outn = w;
+    return o;
 }
 
 /*
@@ -337,6 +428,16 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const*string, co
             const GLchar *s = string ? string[i] : NULL;
             if (!s) { sc_emit_u32(0); continue; }
             size_t n = (length && length[i] >= 0) ? (size_t)length[i] : strlen(s);
+            if (sc_highp_on() && n) {
+                size_t n2 = 0; int nrep = 0;
+                char *rw = sc_highp_rewrite(s, n, &n2, &nrep);
+                if (rw) {
+                    if (trace && nrep) fprintf(stderr, "[sc-shader] id=%u piece %d: %d x mediump/lowp -> highp\n", shader, (int)i, nrep);
+                    sc_emit_bytes(rw, n2);
+                    free(rw);
+                    continue;
+                }
+            }
             sc_emit_bytes(s, n);
         }
     }
@@ -355,7 +456,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei widt
     sc_emit_u32(target); sc_emit_i32(level); sc_emit_i32(internalformat);
     sc_emit_i32(width); sc_emit_i32(height); sc_emit_i32(border);
     sc_emit_u32(format); sc_emit_u32(type);
-    size_t sz = pixels ? sc_pixel_size(format, type) * (size_t)width * (size_t)height : 0;
+    size_t sz = pixels ? sc_image_bytes(format, type, width, height) : 0;
     sc_emit_bytes(pixels, sz);
     sc_batch_end();
 }
@@ -363,7 +464,7 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoff, GLint yoff, GLsizei
     sc_batch_begin(SC_GL_glTexSubImage2D);
     sc_emit_u32(target); sc_emit_i32(level); sc_emit_i32(xoff); sc_emit_i32(yoff);
     sc_emit_i32(width); sc_emit_i32(height); sc_emit_u32(format); sc_emit_u32(type);
-    size_t sz = pixels ? sc_pixel_size(format, type) * (size_t)width * (size_t)height : 0;
+    size_t sz = pixels ? sc_image_bytes(format, type, width, height) : 0;
     sc_emit_bytes(pixels, sz);
     sc_batch_end();
 }
@@ -468,6 +569,7 @@ VATT_FV(1) VATT_FV(2) VATT_FV(3) VATT_FV(4)
 #undef VATT_FV
 
 void glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer) {
+    if (ca_on_pointer(index, size, type, normalized, stride, pointer, 0)) return;  /* puntero cliente: se sube al dibujar */
     sc_batch_begin(SC_GL_glVertexAttribPointer);
     sc_emit_u32(index); sc_emit_i32(size); sc_emit_u32(type); sc_emit_u32(normalized);
     sc_emit_i32(stride); emit_ptr(pointer);
@@ -692,7 +794,13 @@ GLenum glGetError(void) {
 /* ============================================================ ES 3.0 nuevas — void */
 
 void glReadBuffer(GLenum src) { sc_batch_begin(SC_GL_glReadBuffer); sc_emit_u32(src); sc_batch_end(); }
-void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) { sc_batch_begin(SC_GL_glDrawRangeElements); sc_emit_u32(mode); sc_emit_u32(start); sc_emit_u32(end); sc_emit_i32(count); sc_emit_u32(type); emit_ptr(indices); sc_batch_end(); }
+void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices) {
+    sc_ca_ctx *s = ca_cur(); const void *ind = indices; int ca = ca_begin(s, 1, 0, count, type, &ind, 1);
+    if (ca < 0) return;
+    sc_batch_begin(SC_GL_glDrawRangeElements); sc_emit_u32(mode); sc_emit_u32(start); sc_emit_u32(end); sc_emit_i32(count); sc_emit_u32(type); emit_ptr(ind); sc_batch_end();
+    ca_end(s, ca);
+    sc_chk("glDrawRangeElements", (long)start, (long)end, (long)count, (long)(uintptr_t)indices);
+}
 void glTexImage3D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLsizei d, GLint border, GLenum format, GLenum type, const void *pixels) {
     sc_batch_begin(SC_GL_glTexImage3D);
     sc_emit_u32(target); sc_emit_i32(level); sc_emit_i32(ifmt);
@@ -725,7 +833,25 @@ void glGetQueryiv(GLenum target, GLenum pname, GLint *out) {
     if (sc_sync_send() != 0) return;
     int32_t v = 0; sc_sync_recv_bytes(&v, 4); if (out) *out = v;
 }
+/*
+ * SC_QUERY_VISIBLE=1: las occlusion queries siempre responden "disponible" y "visible"
+ * (resultado grande, para pasar umbrales tipo oqfrags=8 de Cube 2 / Red Eclipse), sin ir
+ * al daemon. Sirve para (a) diagnosticar mapas donde solo se dibuja el chunk de la camara,
+ * (b) ahorrar el round-trip sincrono por query. Costo: se dibuja todo (sin oclusion).
+ */
+static int sc_query_visible(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("SC_QUERY_VISIBLE"); v = (e && *e == '1'); }
+    return v;
+}
+static int sc_query_fake(GLenum pname, uint64_t *out) {
+    if (!sc_query_visible()) return 0;
+    if (pname == 0x8867) { *out = 1; return 1; }            /* GL_QUERY_RESULT_AVAILABLE */
+    if (pname == 0x8866) { *out = 0x00FFFFFFu; return 1; }  /* GL_QUERY_RESULT */
+    return 0;
+}
 void glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint *out) {
+    { uint64_t f; if (sc_query_fake(pname, &f)) { if (out) *out = (GLuint)f; return; } }
     sc_sync_begin(SC_GL_glGetQueryObjectuiv); sc_emit_u32(id); sc_emit_u32(pname);
     if (sc_sync_send() != 0) return;
     uint32_t v = 0; sc_sync_recv_bytes(&v, 4); if (out) *out = v;
@@ -797,6 +923,7 @@ static int map_trace(void) {
 }
 
 static void map_upload(GLenum target, GLintptr off, const void *data, GLsizeiptr len) {
+    ca_shadow_sub(target, off, len, data);
     sc_batch_begin(SC_GL_glBufferSubData);
     sc_emit_u32(target); sc_emit_u64((uint64_t)off); sc_emit_u64((uint64_t)len);
     sc_emit_bytes(data, (size_t)len);
@@ -867,7 +994,7 @@ GLboolean glUnmapBuffer(GLenum target) {
 }
 
 void glDeleteVertexArrays(GLsizei n, const GLuint *vs) { sc_batch_begin(SC_GL_glDeleteVertexArrays); emit_u32v(vs, n); sc_batch_end(); }
-void glBindVertexArray(GLuint va) { sc_batch_begin(SC_GL_glBindVertexArray); sc_emit_u32(va); sc_batch_end(); }
+void glBindVertexArray(GLuint va) { ca_on_bind_vao(va); sc_batch_begin(SC_GL_glBindVertexArray); sc_emit_u32(va); sc_batch_end(); }
 GLboolean glIsVertexArray(GLuint va) { sc_sync_begin(SC_GL_glIsVertexArray); sc_emit_u32(va); if (sc_sync_send() != 0) return 0; return (GLboolean)sc_sync_result(); }
 void glGetIntegeri_v(GLenum target, GLuint index, GLint *out) {
     sc_sync_begin(SC_GL_glGetIntegeri_v); sc_emit_u32(target); sc_emit_u32(index);
@@ -907,7 +1034,7 @@ void glGetTransformFeedbackVarying(GLuint program, GLuint index, GLsizei bufSize
     }
     free(tmp);
 }
-void glVertexAttribIPointer(GLuint idx, GLint size, GLenum type, GLsizei stride, const void *pointer) { sc_batch_begin(SC_GL_glVertexAttribIPointer); sc_emit_u32(idx); sc_emit_i32(size); sc_emit_u32(type); sc_emit_i32(stride); emit_ptr(pointer); sc_batch_end(); }
+void glVertexAttribIPointer(GLuint idx, GLint size, GLenum type, GLsizei stride, const void *pointer) { if (ca_on_pointer(idx, size, type, GL_FALSE, stride, pointer, 1)) return; sc_batch_begin(SC_GL_glVertexAttribIPointer); sc_emit_u32(idx); sc_emit_i32(size); sc_emit_u32(type); sc_emit_i32(stride); emit_ptr(pointer); sc_batch_end(); }
 void glGetVertexAttribIiv(GLuint idx, GLenum pname, GLint *out) {
     sc_sync_begin(SC_GL_glGetVertexAttribIiv); sc_emit_u32(idx); sc_emit_u32(pname);
     if (sc_sync_send() != 0) return;
@@ -990,8 +1117,18 @@ void glGetActiveUniformBlockName(GLuint p, GLuint idx, GLsizei bufSize, GLsizei 
     read_named_string(bufSize, length, name);
 }
 void glUniformBlockBinding(GLuint p, GLuint bi, GLuint bb) { sc_batch_begin(SC_GL_glUniformBlockBinding); sc_emit_u32(p); sc_emit_u32(bi); sc_emit_u32(bb); sc_batch_end(); }
-void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei inst) { sc_batch_begin(SC_GL_glDrawArraysInstanced); sc_emit_u32(mode); sc_emit_i32(first); sc_emit_i32(count); sc_emit_i32(inst); sc_batch_end(); }
-void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei inst) { sc_batch_begin(SC_GL_glDrawElementsInstanced); sc_emit_u32(mode); sc_emit_i32(count); sc_emit_u32(type); emit_ptr(indices); sc_emit_i32(inst); sc_batch_end(); }
+void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei inst) {
+    sc_ca_ctx *s = ca_cur(); int ca = ca_begin(s, 0, first, count, 0, NULL, inst);
+    if (ca < 0) return;
+    sc_batch_begin(SC_GL_glDrawArraysInstanced); sc_emit_u32(mode); sc_emit_i32(first); sc_emit_i32(count); sc_emit_i32(inst); sc_batch_end();
+    ca_end(s, ca);
+}
+void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei inst) {
+    sc_ca_ctx *s = ca_cur(); const void *ind = indices; int ca = ca_begin(s, 1, 0, count, type, &ind, inst);
+    if (ca < 0) return;
+    sc_batch_begin(SC_GL_glDrawElementsInstanced); sc_emit_u32(mode); sc_emit_i32(count); sc_emit_u32(type); emit_ptr(ind); sc_emit_i32(inst); sc_batch_end();
+    ca_end(s, ca);
+}
 
 GLsync glFenceSync(GLenum cond, GLbitfield flags) {
     sc_sync_begin(SC_GL_glFenceSync); sc_emit_u32(cond); sc_emit_u32((uint32_t)flags);
@@ -1068,7 +1205,7 @@ void glGetSamplerParameterfv(GLuint s, GLenum p, GLfloat *out) {
     if (sc_sync_send() != 0) return;
     float v = 0; sc_sync_recv_bytes(&v, 4); if (out) *out = v;
 }
-void glVertexAttribDivisor(GLuint idx, GLuint div) { sc_batch_begin(SC_GL_glVertexAttribDivisor); sc_emit_u32(idx); sc_emit_u32(div); sc_batch_end(); }
+void glVertexAttribDivisor(GLuint idx, GLuint div) { ca_on_divisor(idx, div); sc_batch_begin(SC_GL_glVertexAttribDivisor); sc_emit_u32(idx); sc_emit_u32(div); sc_batch_end(); }
 void glBindTransformFeedback(GLenum t, GLuint id) { sc_batch_begin(SC_GL_glBindTransformFeedback); sc_emit_u32(t); sc_emit_u32(id); sc_batch_end(); }
 void glDeleteTransformFeedbacks(GLsizei n, const GLuint *ids) { sc_batch_begin(SC_GL_glDeleteTransformFeedbacks); emit_u32v(ids, n); sc_batch_end(); }
 GLboolean glIsTransformFeedback(GLuint id) { sc_sync_begin(SC_GL_glIsTransformFeedback); sc_emit_u32(id); if (sc_sync_send() != 0) return 0; return (GLboolean)sc_sync_result(); }
@@ -1264,9 +1401,9 @@ void glSamplerParameterIiv(GLuint s, GLenum p, const GLint *v) { sc_batch_begin(
 void glSamplerParameterIuiv(GLuint s, GLenum p, const GLuint *v) { sc_batch_begin(SC_GL_glSamplerParameterIuiv); sc_emit_u32(s); sc_emit_u32(p); sc_emit_u32(v ? v[0] : 0); sc_batch_end(); }
 void glGetSamplerParameterIiv(GLuint s, GLenum p, GLint *out) { sc_sync_begin(SC_GL_glGetSamplerParameterIiv); sc_emit_u32(s); sc_emit_u32(p); if (sc_sync_send() != 0) return; int32_t v = 0; sc_sync_recv_bytes(&v, 4); if (out) *out = v; }
 void glGetSamplerParameterIuiv(GLuint s, GLenum p, GLuint *out) { sc_sync_begin(SC_GL_glGetSamplerParameterIuiv); sc_emit_u32(s); sc_emit_u32(p); if (sc_sync_send() != 0) return; uint32_t v = 0; sc_sync_recv_bytes(&v, 4); if (out) *out = v; }
-void glGetQueryObjectiv(GLuint id, GLenum p, GLint *out) { sc_sync_begin(SC_GL_glGetQueryObjectiv); sc_emit_u32(id); sc_emit_u32(p); if (sc_sync_send() != 0) return; int32_t v = 0; sc_sync_recv_bytes(&v, 4); if (out) *out = v; }
-void glGetQueryObjecti64v(GLuint id, GLenum p, GLint64 *out) { sc_sync_begin(SC_GL_glGetQueryObjecti64v); sc_emit_u32(id); sc_emit_u32(p); if (sc_sync_send() != 0) return; int64_t v = 0; sc_sync_recv_bytes(&v, 8); if (out) *out = v; }
-void glGetQueryObjectui64v(GLuint id, GLenum p, GLuint64 *out) { sc_sync_begin(SC_GL_glGetQueryObjectui64v); sc_emit_u32(id); sc_emit_u32(p); if (sc_sync_send() != 0) return; uint64_t v = 0; sc_sync_recv_bytes(&v, 8); if (out) *out = v; }
+void glGetQueryObjectiv(GLuint id, GLenum p, GLint *out) { { uint64_t f; if (sc_query_fake(p, &f)) { if (out) *out = (GLint)f; return; } } sc_sync_begin(SC_GL_glGetQueryObjectiv); sc_emit_u32(id); sc_emit_u32(p); if (sc_sync_send() != 0) return; int32_t v = 0; sc_sync_recv_bytes(&v, 4); if (out) *out = v; }
+void glGetQueryObjecti64v(GLuint id, GLenum p, GLint64 *out) { { uint64_t f; if (sc_query_fake(p, &f)) { if (out) *out = (GLint64)f; return; } } sc_sync_begin(SC_GL_glGetQueryObjecti64v); sc_emit_u32(id); sc_emit_u32(p); if (sc_sync_send() != 0) return; int64_t v = 0; sc_sync_recv_bytes(&v, 8); if (out) *out = v; }
+void glGetQueryObjectui64v(GLuint id, GLenum p, GLuint64 *out) { { uint64_t f; if (sc_query_fake(p, &f)) { if (out) *out = (GLuint64)f; return; } } sc_sync_begin(SC_GL_glGetQueryObjectui64v); sc_emit_u32(id); sc_emit_u32(p); if (sc_sync_send() != 0) return; uint64_t v = 0; sc_sync_recv_bytes(&v, 8); if (out) *out = v; }
 void glGetQueryBufferObjectiv(GLuint id, GLuint buf, GLenum p, GLintptr off) { sc_batch_begin(SC_GL_glGetQueryBufferObjectiv); sc_emit_u32(id); sc_emit_u32(buf); sc_emit_u32(p); sc_emit_u64((uint64_t)off); sc_batch_end(); }
 void glGetQueryBufferObjectuiv(GLuint id, GLuint buf, GLenum p, GLintptr off) { sc_batch_begin(SC_GL_glGetQueryBufferObjectuiv); sc_emit_u32(id); sc_emit_u32(buf); sc_emit_u32(p); sc_emit_u64((uint64_t)off); sc_batch_end(); }
 void glGetQueryBufferObjecti64v(GLuint id, GLuint buf, GLenum p, GLintptr off) { sc_batch_begin(SC_GL_glGetQueryBufferObjecti64v); sc_emit_u32(id); sc_emit_u32(buf); sc_emit_u32(p); sc_emit_u64((uint64_t)off); sc_batch_end(); }
@@ -1317,6 +1454,10 @@ void glProgramBinary(GLuint p, GLenum fmt, const void *binary, GLsizei length) {
     sc_emit_bytes(binary, binary ? (size_t)length : 0);
     sc_batch_end();
 }
+/* GL_OES_get_program_binary: misma firma y semantica que el core ES 3.0.
+ * Se reusa el opcode de glGetProgramBinary/glProgramBinary. */
+void glGetProgramBinaryOES(GLuint p, GLsizei bufSize, GLsizei *length, GLenum *binaryFormat, void *binary) { glGetProgramBinary(p, bufSize, length, binaryFormat, binary); }
+void glProgramBinaryOES(GLuint p, GLenum fmt, const void *binary, GLint length) { glProgramBinary(p, fmt, binary, (GLsizei)length); }
 void glProgramParameteri(GLuint p, GLenum pname, GLint value) { sc_batch_begin(SC_GL_glProgramParameteri); sc_emit_u32(p); sc_emit_u32(pname); sc_emit_i32(value); sc_batch_end(); }
 
 void glEGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image) { sc_batch_begin(SC_GL_glEGLImageTargetTexture2DOES); sc_emit_u32(target); sc_emit_u64((uint64_t)(uintptr_t)image); sc_batch_end(); }
@@ -1452,6 +1593,10 @@ static void *lookup_gl(const char *name) {
     if (!strcmp(name, "glGetObjectPtrLabelKHR"))                   return (void*)glGetObjectPtrLabelKHR;
     if (!strcmp(name, "glGetPointervKHR"))                         return (void*)glGetPointervKHR;
     if (!strcmp(name, "glQueryCounterEXT"))                        return (void*)glQueryCounterEXT;
+    if (!strcmp(name, "glGetProgramBinaryOES"))                    return (void*)glGetProgramBinaryOES;
+    if (!strcmp(name, "glProgramBinaryOES"))                       return (void*)glProgramBinaryOES;
+    if (!strcmp(name, "glGetProgramBinary"))                       return (void*)glGetProgramBinary;
+    if (!strcmp(name, "glProgramBinary"))                          return (void*)glProgramBinary;
     if (!strcmp(name, "glGetQueryObjecti64vEXT"))                  return (void*)glGetQueryObjecti64vEXT;
     if (!strcmp(name, "glGetQueryObjectui64vEXT"))                 return (void*)glGetQueryObjectui64vEXT;
     if (!strcmp(name, "glGetQueryObjectivEXT"))                    return (void*)glGetQueryObjectivEXT;

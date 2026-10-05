@@ -82,4 +82,8 @@ const char *sc_string_intern(const void *bytes, size_t len);
 const char *sc_string_intern_slot(const void *bytes, size_t len,
                                   uint32_t name, uint32_t index);
 
+/* ---- arrays cliente (sc_clientarr.h) ---- */
+void sc_ca_make_current(const void *ctx);
+void sc_ca_destroy(const void *ctx);
+
 #endif /* SC_CORE_H */
