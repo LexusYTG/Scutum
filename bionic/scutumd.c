@@ -188,7 +188,7 @@ GL_FUNCS(DECL_FP)
     X(eglBindTexImage) X(eglReleaseTexImage) X(eglBindAPI) X(eglQueryAPI) \
     X(eglGetProcAddress) X(eglWaitClient) X(eglWaitGL) X(eglWaitNative) \
     X(eglCreateSync) X(eglDestroySync) X(eglClientWaitSync) X(eglWaitSync) \
-    X(eglGetSyncAttrib)
+    X(eglGetSyncAttrib) X(eglQueryContext)
 
 #define DECL_FPE(n) static void *p_##n;
 EGL_FUNCS(DECL_FPE)
@@ -199,6 +199,26 @@ EGL_FUNCS(DECL_FPE)
  * void el caller lo ignora, para las que devuelven valor (GLboolean, GLint,
  * GLuint, void*, GLsync) es el "no-op/error" razonable. Evita segfaults. */
 static uintptr_t sc_noop_zero(void) { return 0; }
+
+
+#define SC_EGL_OPENGL_ES3_BIT 0x00000040
+static int g_es3_supported = -1;
+static int sc_egl_supports_es3(EGLDisplay dpy) {
+    if (g_es3_supported >= 0) return g_es3_supported;
+    g_es3_supported = 0;
+    if (!p_eglChooseConfig) return 0;
+    EGLint attrs[] = {
+        EGL_RENDERABLE_TYPE, SC_EGL_OPENGL_ES3_BIT,
+        EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
+        EGL_NONE
+    };
+    EGLConfig cfg = NULL;
+    EGLint n = 0;
+    EGLBoolean ok = ((EGLBoolean(*)(EGLDisplay,const EGLint*,EGLConfig*,EGLint,EGLint*))
+                     p_eglChooseConfig)(dpy, attrs, &cfg, 1, &n);
+    if (ok && n > 0) g_es3_supported = 1;
+    return g_es3_supported;
+}
 
 static int load_one(void *h, const char *n, void **out) {
     *out = dlsym(h, n);
@@ -1862,7 +1882,9 @@ static int32_t exec_egl_one(uint32_t op, struct rd *r, struct wr *w) {
         free(cfgs);
         return ok ? 1 : 0;
     }
-    case SC_EGL_CHOOSE_CONFIG: {
+
+/* Deteccion de ES3: una vez por proceso, prueba pedir una config con
+ * EGL_OPENGL_ES3_BIT (0x40). Si el driver devuelve al menos una, hay ES3. */    case SC_EGL_CHOOSE_CONFIG: {
         ARG_U64(r, q0);
         uint32_t nattr; ARG_U32(r, nattr);
         if (nattr > 256) return -EPROTO;
@@ -1892,6 +1914,12 @@ static int32_t exec_egl_one(uint32_t op, struct rd *r, struct wr *w) {
         EGLint val = 0;
         EGLBoolean ok = ((EGLBoolean(*)(EGLDisplay,EGLConfig,EGLint,EGLint*))p_eglGetConfigAttrib)(
             (EGLDisplay)(uintptr_t)q0, (EGLConfig)(uintptr_t)q1, i0, &val);
+        /* Android Mali reporta solo ES2_BIT aunque soporte ES3. Lorica (y
+         * GLFW/SDL) checan este bit para decidir si pueden crear contexto
+         * core 3.x. Lo sintetizamos aqui. */
+        if (ok && i0 == EGL_RENDERABLE_TYPE && sc_egl_supports_es3((EGLDisplay)(uintptr_t)q0)) {
+            val |= SC_EGL_OPENGL_ES3_BIT;
+        }
         if (w) wr_i32(w, val);
         return ok ? 1 : 0;
     }
@@ -1920,6 +1948,14 @@ static int32_t exec_egl_one(uint32_t op, struct rd *r, struct wr *w) {
         EGLBoolean ok = ((EGLBoolean(*)(EGLDisplay,EGLSurface,EGLSurface,EGLContext))p_eglMakeCurrent)(
             (EGLDisplay)(uintptr_t)q0, (EGLSurface)(uintptr_t)q1,
             (EGLSurface)(uintptr_t)q2, (EGLContext)(uintptr_t)q3);
+        return ok ? 1 : 0;
+    }
+    case SC_EGL_QUERY_CONTEXT: {
+        ARG_U64(r, q0); ARG_U64(r, q1); ARG_I32(r, i0);
+        EGLint val = 0;
+        EGLBoolean ok = ((EGLBoolean(*)(EGLDisplay,EGLContext,EGLint,EGLint*))p_eglQueryContext)(
+            (EGLDisplay)(uintptr_t)q0, (EGLContext)(uintptr_t)q1, i0, &val);
+        if (w) wr_i32(w, val);
         return ok ? 1 : 0;
     }
     case SC_EGL_GET_CURRENT_CONTEXT: {

@@ -222,7 +222,8 @@ enum sc_egl_op {
                                                 * resp: i32 ok */
     SC_EGL_GET_CURRENT_CONTEXT      = 0x0116,  /* req: ; resp: u64 context */
     SC_EGL_GET_CURRENT_SURFACE      = 0x0117,  /* req: i32 readdraw; resp: u64 surface */
-    SC_EGL_GET_CURRENT_DISPLAY      = 0x0118,  /* req: ; resp: u64 display */
+    SC_EGL_GET_CURRENT_DISPLAY      = 0x0118,
+    SC_EGL_QUERY_CONTEXT            = 0x012C,  /* req: u64 display, u64 ctx, i32 attrib; resp: i32 ok, i32 value */  /* req: ; resp: u64 display */
     SC_EGL_RELEASE_THREAD           = 0x011A,  /* req: ; resp: i32 ok */
 
     /* surface */

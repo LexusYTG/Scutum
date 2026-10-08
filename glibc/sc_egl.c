@@ -357,6 +357,21 @@ const char *eglQueryString(EGLDisplay dpy, EGLint name) {
     return sc_string_intern_slot(buf + 4, len, (uint32_t)name, 0);
 }
 
+EGLBoolean eglQueryContext(EGLDisplay dpy, EGLContext ctx,
+                            EGLint attribute, EGLint *value)
+{
+    sc_sync_begin(SC_EGL_QUERY_CONTEXT);
+    sc_emit_u64(EH(dpy));
+    sc_emit_u64(EH(ctx));
+    sc_emit_i32(attribute);
+    if (sc_sync_send() != 0) return EGL_FALSE;
+    int32_t ok = sc_sync_result();
+    int32_t v  = 0;
+    sc_sync_recv_bytes(&v, 4);
+    if (value) *value = v;
+    return ok ? EGL_TRUE : EGL_FALSE;
+}
+
 EGLint eglGetError(void) {
     sc_sync_begin(SC_EGL_GET_ERROR);
     if (sc_sync_send() != 0) return EGL_NOT_INITIALIZED;
