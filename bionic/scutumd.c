@@ -36,7 +36,9 @@
 #include <GLES3/gl32.h>
 #include <GLES3/gl3ext.h>
 
+#include <stdatomic.h>
 #include "scutum.h"
+#include "sc_shm.h"
 #include "sc_gl_enum.h"
 
 /* Constantes que faltan en algunos sysroots GLES; mismo valor OpenGL.
@@ -281,10 +283,20 @@ struct client {
     uint32_t thread_id;
     pthread_t th;
     uint8_t *inbuf; size_t inlen, incap;
+
+    /* bus de comandos por memoria compartida (se activa tras el HELLO) */
+    void *shm; size_t shm_len;
+    struct sc_ring rxr;          /* req: shim -> daemon (soy consumidor) */
+    struct sc_ring txr;          /* rsp: daemon -> shim (soy productor) */
+    struct sc_wait wrx, wtx;
+    uint64_t pend_rel;           /* bytes del ring req a liberar tras procesar el frame */
 };
 
-static int c_read_msg(struct client *c, struct sc_msg *h, uint8_t **payload_out,
-                      int *fds_out, uint32_t *n_fds_out)
+static char g_sockpath[256];
+
+/* Lectura por SOCKET: solo handshake (HELLO) y tokens SC_OP_FD con SCM_RIGHTS. */
+static int c_read_msg_sock(struct client *c, struct sc_msg *h, uint8_t **payload_out,
+                           int *fds_out, uint32_t *n_fds_out)
 {
     struct iovec iov = { h, sizeof *h };
     char cmsgbuf[CMSG_SPACE(SC_MAX_FDS * sizeof(int))];
@@ -333,8 +345,9 @@ static int c_read_msg(struct client *c, struct sc_msg *h, uint8_t **payload_out,
     return 0;
 }
 
-static int c_send_hdr_payload(struct client *c, uint32_t op, uint32_t req,
-                              const void *payload, uint32_t len)
+/* Envio por SOCKET: solo antes de que exista la region compartida (errores del handshake). */
+static int c_send_sock(struct client *c, uint32_t op, uint32_t req,
+                       const void *payload, uint32_t len)
 {
     struct sc_msg h = { SC_MAGIC, op, len, req, 0, 0 };
     struct iovec iov[2];
@@ -349,9 +362,141 @@ static int c_send_hdr_payload(struct client *c, uint32_t op, uint32_t req,
     return 0;
 }
 
+/* ------------------------------------------------------------ memoria compartida */
+
+#ifndef SYS_memfd_create
+# if defined(__aarch64__)
+#  define SYS_memfd_create 279
+# elif defined(__x86_64__)
+#  define SYS_memfd_create 319
+# elif defined(__arm__)
+#  define SYS_memfd_create 385
+# endif
+#endif
+
+/* memfd si se puede; si no, un archivo anonimo junto al socket (unlink inmediato).
+ * El archivo es un ultimo recurso para OBTENER memoria compartida, no un
+ * transporte alternativo: el bus sigue siendo el mismo par de rings. */
+static int shm_open_fd(size_t total) {
+    int fd = -1;
+#ifdef SYS_memfd_create
+    fd = (int)syscall(SYS_memfd_create, "scutum-shm", 1u /* MFD_CLOEXEC */);
+#endif
+    if (fd < 0) {
+        char p[sizeof g_sockpath + 16];
+        snprintf(p, sizeof p, "%s.shm.XXXXXX", g_sockpath);
+        fd = mkstemp(p);
+        if (fd >= 0) { unlink(p); fcntl(fd, F_SETFD, FD_CLOEXEC); }
+    }
+    if (fd < 0) return -1;
+    if (ftruncate(fd, (off_t)total) < 0) { int e = errno; close(fd); errno = e; return -1; }
+    return fd;
+}
+
+/* HELLO_ACK por socket con el memfd adjunto (SCM_RIGHTS). */
+static int c_send_hello_ack(struct client *c, uint32_t req, int shm_fd,
+                            uint32_t total, uint32_t ring)
+{
+    uint32_t ack[4] = { SC_PROTO_VERSION,
+        SC_CAP_EGL_15 | SC_CAP_GLES_30 | SC_CAP_GLES_31 | SC_CAP_GLES_32 | SC_CAP_SHM,
+        total, ring };
+    struct sc_msg h = { SC_MAGIC, SC_OP_HELLO_ACK, sizeof ack, req, 0, 0 };
+    struct iovec iov[2] = { { &h, sizeof h }, { ack, sizeof ack } };
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    struct msghdr mh; memset(&mh, 0, sizeof mh);
+    mh.msg_iov = iov; mh.msg_iovlen = 2;
+    mh.msg_control = cmsgbuf; mh.msg_controllen = sizeof cmsgbuf;
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+    cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &shm_fd, sizeof(int));
+    ssize_t w;
+    do { w = sendmsg(c->fd, &mh, MSG_NOSIGNAL); } while (w < 0 && errno == EINTR);
+    if (w < 0) return -errno;
+    if ((size_t)w != sizeof h + sizeof ack) return -EIO;
+    return 0;
+}
+
+/* Crea la region de esta conexion, la mapea y se la entrega al shim. */
+static int c_shm_setup(struct client *c, uint32_t req) {
+    unsigned mb = SC_SHM_DEF_MB;
+    const char *e = getenv("SCUTUM_SHM_MB");
+    if (e && *e) {
+        unsigned v = (unsigned)strtoul(e, NULL, 10);
+        if (v >= 2 && v <= 256 && !(v & (v - 1))) mb = v;
+    }
+    uint32_t ring = (uint32_t)((mb * 1024u * 1024u) / 2u);   /* 2 rings = mb MiB de datos */
+    size_t total = sc_shm_total(ring);
+
+    int fd = shm_open_fd(total);
+    if (fd < 0) return -errno;
+    void *m = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { int er = errno; close(fd); return -er; }
+
+    struct sc_shm_ctrl *ctl = m;            /* la region viene en cero */
+    ctl->magic = SC_SHM_MAGIC; ctl->version = SC_PROTO_VERSION; ctl->ring_size = ring;
+
+    int rc = c_send_hello_ack(c, req, fd, (uint32_t)total, ring);
+    close(fd);
+    if (rc) { munmap(m, total); return rc; }
+
+    c->shm = m; c->shm_len = total;
+    sc_ring_init(&c->rxr, &ctl->req, (uint8_t *)m + SC_SHM_CTRL_SZ, ring);
+    sc_ring_init(&c->txr, &ctl->rsp, (uint8_t *)m + SC_SHM_CTRL_SZ + ring, ring);
+
+    /* Idle: spin SCUTUM_SPIN_US (default 2 ms) y luego futex. 0 => nunca duerme. */
+    uint64_t spin = sc_env_us_to_ns("SCUTUM_SPIN_US", 2000);
+    c->wrx.alive_fd = c->fd; c->wrx.spin_ns = spin; c->wrx.timeout_ns = 0;
+    c->wtx.alive_fd = c->fd; c->wtx.spin_ns = spin; c->wtx.timeout_ns = 60ull * 1000000000ull;
+    return 0;
+}
+
+/* Lee el proximo mensaje: por socket hasta el HELLO; luego SIEMPRE por el ring req.
+ * Si el frame trae SC_MSGF_FD, el fd llega antes por el socket (SC_OP_FD). */
+static int c_read_msg(struct client *c, struct sc_msg *h, uint8_t **payload_out,
+                      int *fds_out, uint32_t *n_fds_out)
+{
+    if (!c->shm) return c_read_msg_sock(c, h, payload_out, fds_out, n_fds_out);
+
+    const uint8_t *p = NULL; uint64_t rel = 0;
+    int rc = sc_ring_recv(&c->rxr, h, &p, &rel, &c->inbuf, &c->incap, 1,
+                          SC_MAX_PAYLOAD, &c->wrx);
+    if (rc) return rc;
+    c->pend_rel = rel;
+    *n_fds_out = 0;
+    if (h->pad & SC_MSGF_FD) {
+        struct sc_msg th; uint8_t *tp = NULL; int tf[SC_MAX_FDS]; uint32_t nf = 0;
+        rc = c_read_msg_sock(c, &th, &tp, tf, &nf);
+        if (rc) return rc;
+        if (th.op != SC_OP_FD || nf < 1) {
+            for (uint32_t i = 0; i < nf; i++) close(tf[i]);
+            return -EPROTO;
+        }
+        fds_out[0] = tf[0];
+        for (uint32_t i = 1; i < nf; i++) close(tf[i]);
+        *n_fds_out = 1;
+    }
+    c->inlen = h->len;
+    *payload_out = (uint8_t *)p;
+    return 0;
+}
+
+static int c_send_hdr_payload(struct client *c, uint32_t op, uint32_t req,
+                              const void *payload, uint32_t len)
+{
+    if (!c->shm) return c_send_sock(c, op, req, payload, len);
+    struct sc_msg h = { SC_MAGIC, op, len, req, 0, 0 };
+    return sc_ring_send(&c->txr, &h, payload, len, &c->wtx);
+}
+
 static int c_send_sync(struct client *c, uint32_t req, int32_t result,
                        const void *payload, size_t plen)
 {
+    if (c->shm) {                      /* [i32 result][payload] directo al ring, sin copias intermedias */
+        if (plen > SC_MAX_PAYLOAD - 4) return -EMSGSIZE;
+        struct sc_msg h = { SC_MAGIC, SC_OP_GL_SYNC, (uint32_t)(4 + plen), req, 0, 0 };
+        return sc_ring_send2(&c->txr, &h, &result, 4, payload, (uint32_t)plen, &c->wtx);
+    }
     uint8_t *buf = malloc(4 + plen);
     if (!buf) return -ENOMEM;
     memcpy(buf, &result, 4);
@@ -2539,6 +2684,10 @@ static void *client_thread(void *arg) {
             if (i == 0 && (h.op == SC_OP_EGL || h.op == SC_OP_GL_SYNC)) g_req_fd = fds[0];
             else close(fds[i]);
         }
+        if (!c->shm && h.op != SC_OP_HELLO) {     /* por socket solo se acepta el HELLO */
+            c_send_error(c, h.req_id, SC_E_PROTO, SC_PERR_OPCODE, "handshake required");
+            goto done;
+        }
 
         switch (h.op) {
         case SC_OP_HELLO: {
@@ -2548,9 +2697,18 @@ static void *client_thread(void *arg) {
                 c_send_error(c, h.req_id, SC_E_PROTO, SC_PERR_VERSION, "bad proto version");
                 goto done;
             }
-            uint32_t ack[2] = { SC_PROTO_VERSION,
-                SC_CAP_EGL_15 | SC_CAP_GLES_30 | SC_CAP_GLES_31 | SC_CAP_GLES_32 };
-            c_send_hdr_payload(c, SC_OP_HELLO_ACK, h.req_id, ack, sizeof ack);
+            if (c->shm) {                          /* HELLO repetido */
+                c_send_error(c, h.req_id, SC_E_PROTO, SC_PERR_FRAMING, "duplicate hello");
+                goto done;
+            }
+            int src = c_shm_setup(c, h.req_id);    /* HELLO_ACK + memfd por socket */
+            if (src) {
+                ERR("[scutumd] no se pudo crear la memoria compartida (rc=%d)\n", src);
+                c_send_error(c, h.req_id, SC_E_INTERNAL, (uint32_t)(-src), "shm setup failed");
+                goto done;
+            }
+            LOG("[scutumd] cliente %d: bus por memoria compartida (%zu KiB)\n",
+                c->fd, c->shm_len / 1024);
             break;
         }
         case SC_OP_PING:
@@ -2623,8 +2781,14 @@ static void *client_thread(void *arg) {
             c_send_error(c, h.req_id, SC_E_PROTO, SC_PERR_OPCODE, "unknown msg op");
             break;
         }
+
+        if (c->pend_rel) {                    /* frame parseado en sitio: liberar el espacio */
+            sc_ring_advance(&c->rxr, c->pend_rel);
+            c->pend_rel = 0;
+        }
     }
 done:
+    if (c->shm) munmap(c->shm, c->shm_len);
     if (c->fd >= 0) close(c->fd);
     free(c->inbuf);
     free(c);
@@ -2651,6 +2815,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    snprintf(g_sockpath, sizeof g_sockpath, "%s", path);
     unlink(path);
 
     int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);

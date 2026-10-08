@@ -4,9 +4,14 @@
  * ============================================================
  * TRANSPORTE
  * ============================================================
- * Unix socket AF_UNIX, SOCK_STREAM, SOCK_CLOEXEC.
- * Path: $SCUTUM_SOCK o /tmp/scutum.sock.
- * Framing: [sc_msg header 16B] + payload[header.len].
+ * Dos canales:
+ *   - Socket AF_UNIX, SOCK_STREAM, SOCK_CLOEXEC. Path: $SCUTUM_SOCK o
+ *     /tmp/scutum.sock. SOLO handshake (HELLO / HELLO_ACK), paso de fds
+ *     sueltos (SC_OP_FD + SCM_RIGHTS) y deteccion de desconexion.
+ *   - Memoria compartida (memfd entregado por el daemon en el HELLO_ACK):
+ *     dos rings SPSC, uno por sentido. TODO el trafico de comandos y
+ *     respuestas va por ahi. Ver sc_shm.h.
+ * Framing (ambos canales): [sc_msg header 24B] + payload[header.len].
  * Los mensajes son little-endian, alineados a 8 bytes.
  *
  * Thread ID: el header lleva thread_id. EGL es per-thread (contexto actual,
@@ -19,9 +24,10 @@
  * VERSIONADO
  * ============================================================
  * Al conectar, el cliente envía SC_OP_HELLO con { u32 proto_version }.
- * El daemon responde SC_OP_HELLO_ACK con { u32 proto_version, u32 caps } o
+ * El daemon responde SC_OP_HELLO_ACK con { u32 proto_version, u32 caps, u32 shm_total, u32 ring_size } +
+ * 1 fd (SCM_RIGHTS) con el memfd de la region compartida, o
  * SC_OP_ERROR{E_PROTO_VERSION}. Si las versiones no son iguales, el cliente
- * cierra. SC_PROTO_VERSION=1.
+ * cierra. SC_PROTO_VERSION=2.
  *
  * ============================================================
  * FRAGMENTACION
@@ -94,7 +100,7 @@ extern "C" {
 
 /* ============================================================ version */
 
-#define SC_PROTO_VERSION   1u
+#define SC_PROTO_VERSION   2u
 #define SC_MAGIC           0x53435554u  /* "SCUT" */
 #define SC_SOCK_PATH       "/tmp/scutum.sock"
 #define SC_MAX_PAYLOAD     (64u * 1024u * 1024u)
@@ -110,6 +116,7 @@ extern "C" {
 #define SC_CAP_GLES_31      (1u << 2)
 #define SC_CAP_GLES_32      (1u << 3)
 #define SC_CAP_FD_PASSING   (1u << 4)
+#define SC_CAP_SHM          (1u << 5)   /* bus de comandos por memoria compartida */
 
 /* ============================================================ errores */
 
@@ -139,7 +146,8 @@ enum sc_op {
     SC_OP_ERROR         = 0x03,   /* sc_error */
 
     SC_OP_HELLO         = 0x04,   /* u32 proto_version */
-    SC_OP_HELLO_ACK     = 0x05,   /* u32 proto_version, u32 caps */
+    SC_OP_HELLO_ACK     = 0x05,   /* u32 proto_version, u32 caps, u32 shm_total, u32 ring_size
+                               * + 1 fd (memfd de la region compartida) */
 
     SC_OP_FRAGMENT      = 0x06,   /* u32 frag_id, u32 total, u32 off, u32 len, bytes */
 
@@ -147,7 +155,13 @@ enum sc_op {
     SC_OP_GL_BATCH      = 0x11,   /* u32 n_inst, inst[n_inst] ; sin resp */
     SC_OP_GL_SYNC       = 0x12,   /* inst única ; resp i32 result + bytes */
     SC_OP_SYNC_ACK      = 0x13,   /* ack del batch (opcional, ver flush ack) */
+    SC_OP_FD            = 0x14,   /* SOLO por socket: header sin payload + 1 fd (SCM_RIGHTS).
+                               * Se manda ANTES de publicar en el ring el frame que
+                               * lleva SC_MSGF_FD; el daemon lo recibe al leer ese frame. */
 };
+
+/* flags en sc_msg.pad */
+#define SC_MSGF_FD         (1u << 0)   /* este frame tiene un SC_OP_FD esperando en el socket */
 
 struct sc_msg {
     uint32_t magic;

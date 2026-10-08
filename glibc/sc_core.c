@@ -3,8 +3,11 @@
  *
  * Responsabilidades:
  *   - conexión lazy al daemon (una por hilo, vía pthread_key)
- *   - handshake HELLO/HELLO_ACK con la versión de protocolo
- *   - framing: send/recv con o sin SCM_RIGHTS
+ *   - handshake HELLO/HELLO_ACK por socket: versión de protocolo y recepción
+ *     del memfd con la región compartida (ver sc_shm.h)
+ *   - framing: el socket solo se usa en el handshake y para pasar fds
+ *     (SC_OP_FD); todo comando/respuesta viaja por los rings en memoria
+ *     compartida, sin syscalls en el camino rápido
  *   - batching: acumula instrucciones GL void en un buffer thread-local
  *   - emisión: helpers para agregar argumentos tipados al buffer activo
  *   - sync: ejecuta una instrucción con respuesta
@@ -23,6 +26,7 @@
 #define _GNU_SOURCE
 #include "scutum.h"
 #include "sc_core.h"
+#include "sc_shm.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -30,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
@@ -62,6 +67,13 @@ struct sc_thread {
     /* fd a anexar (SCM_RIGHTS) al proximo sync */
     int      has_tx_fd, tx_fd;
 
+    /* región compartida (un par de rings por conexión) */
+    uint8_t *shm;
+    size_t   shm_len;
+    struct sc_ring txr;        /* req: shim -> daemon (productor) */
+    struct sc_ring rxr;        /* rsp: daemon -> shim (consumidor) */
+    struct sc_wait wtx, wrx;
+
     /* error GL acumulado */
     uint32_t last_gl_error;
 };
@@ -69,10 +81,17 @@ struct sc_thread {
 static pthread_key_t  g_key;
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
+/* Cierra socket y desmapea la región. El próximo uso reconecta. */
+static void conn_drop(struct sc_thread *t) {
+    if (t->shm) { munmap(t->shm, t->shm_len); t->shm = NULL; t->shm_len = 0; }
+    if (t->fd >= 0) { close(t->fd); t->fd = -1; }
+    t->hello_done = 0;
+}
+
 static void thread_free(void *p) {
     struct sc_thread *t = p;
     if (!t) return;
-    if (t->fd >= 0) close(t->fd);
+    conn_drop(t);
     free(t->tx);
     free(t->rx);
     free(t);
@@ -249,6 +268,7 @@ int sc_recv_msg_fds(int fd, struct sc_msg *h, void *payload, uint32_t cap,
 
 /* Lazy: la primera vez que se necesita, conecta y hace HELLO. */
 static int ensure_conn(struct sc_thread *t) {
+    int shm_fd = -1;
     if (t->fd >= 0 && t->hello_done) return 0;
 
     if (t->fd < 0) {
@@ -264,16 +284,41 @@ static int ensure_conn(struct sc_thread *t) {
     if (rc) goto fail;
 
     struct sc_msg h;
-    uint8_t buf[16];
-    rc = sc_recv_msg_fds(t->fd, &h, buf, sizeof buf, NULL, NULL);
-    if (rc) goto fail;
+    uint8_t buf[32];
+    {
+        int fds[1]; uint32_t nf = 1;
+        rc = sc_recv_msg_fds(t->fd, &h, buf, sizeof buf, fds, &nf);
+        if (rc) goto fail;
+        if (nf == 1) shm_fd = fds[0];
+    }
     if (h.op == SC_OP_ERROR) { rc = -EPROTO; goto fail; }
-    if (h.op != SC_OP_HELLO_ACK || h.len < 8) { rc = -EPROTO; goto fail; }
-    uint32_t srv_ver, srv_caps;
-    memcpy(&srv_ver, buf, 4);
-    memcpy(&srv_caps, buf + 4, 4);
+    if (h.op != SC_OP_HELLO_ACK || h.len < 16) { rc = -EPROTO; goto fail; }
+    uint32_t srv_ver, srv_caps, shm_total, ring_size;
+    memcpy(&srv_ver,   buf,      4);
+    memcpy(&srv_caps,  buf + 4,  4);
+    memcpy(&shm_total, buf + 8,  4);
+    memcpy(&ring_size, buf + 12, 4);
     if (srv_ver != SC_PROTO_VERSION) { rc = -EPROTO; goto fail; }
-    (void)srv_caps;
+    if (!(srv_caps & SC_CAP_SHM) || shm_fd < 0) { rc = -EPROTO; goto fail; }
+    if (ring_size < 4096 || (ring_size & (ring_size - 1)) ||
+        shm_total != sc_shm_total(ring_size)) { rc = -EPROTO; goto fail; }
+
+    {
+        void *m = mmap(NULL, shm_total, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+        close(shm_fd); shm_fd = -1;
+        if (m == MAP_FAILED) { rc = -errno; goto fail; }
+        struct sc_shm_ctrl *ctl = m;
+        if (ctl->magic != SC_SHM_MAGIC || ctl->ring_size != ring_size) {
+            munmap(m, shm_total); rc = -EPROTO; goto fail;
+        }
+        t->shm = m; t->shm_len = shm_total;
+        sc_ring_init(&t->txr, &ctl->req, (uint8_t *)m + SC_SHM_CTRL_SZ, ring_size);
+        sc_ring_init(&t->rxr, &ctl->rsp, (uint8_t *)m + SC_SHM_CTRL_SZ + ring_size, ring_size);
+        /* espera de respuesta: spin corto y luego futex. SCUTUM_SPIN_US=0 => nunca duerme. */
+        uint64_t spin = sc_env_us_to_ns("SCUTUM_SPIN_US", 300);
+        t->wtx.alive_fd = t->fd; t->wtx.spin_ns = spin; t->wtx.timeout_ns = 60ull * 1000000000ull;
+        t->wrx = t->wtx;
+    }
     t->hello_done = 1;
     {   /* El timeout de 2 s era para connect/HELLO. Operaciones GL reales (link, compile,
          * uploads grandes en Mali) pueden tardar mas; un timeout cierra la conexion y el
@@ -285,9 +330,24 @@ static int ensure_conn(struct sc_thread *t) {
     return 0;
 
 fail:
-    if (t->fd >= 0) { close(t->fd); t->fd = -1; }
-    t->hello_done = 0;
+    if (shm_fd >= 0) close(shm_fd);
+    conn_drop(t);
     return rc;
+}
+
+/* Publica un frame en el ring req. Si hay fd, primero lo manda por el socket
+ * (SC_OP_FD) para que el daemon lo tenga esperando cuando lea el frame. */
+static int shm_send(struct sc_thread *t, uint32_t op, const void *payload,
+                    uint32_t len, int fd)
+{
+    if (len > SC_MAX_PAYLOAD) return -EMSGSIZE;
+    uint32_t req = t->next_req++;
+    struct sc_msg h = { SC_MAGIC, op, len, req, 0, fd >= 0 ? SC_MSGF_FD : 0u };
+    if (fd >= 0) {
+        int rc = sc_send_msg_fds(t->fd, SC_OP_FD, req, 0, NULL, 0, &fd, 1);
+        if (rc) return rc;
+    }
+    return sc_ring_send(&t->txr, &h, payload, len, &t->wtx);
 }
 
 /* ============================================================ batching */
@@ -377,12 +437,11 @@ static int flush_batch(struct sc_thread *t) {
     int rc = ensure_conn(t);
     uint64_t t0 = st_on() ? st_now() : 0;
     if (rc == 0)
-        rc = sc_send_msg_fds(t->fd, SC_OP_GL_BATCH, t->next_req++, 0,
-                             t->tx, (uint32_t)t->tx_len, NULL, 0);
+        rc = shm_send(t, SC_OP_GL_BATCH, t->tx, (uint32_t)t->tx_len, -1);
     if (t0) { pthread_mutex_lock(&g_st_mu); g_st_batches++; g_st_batch_bytes += t->tx_len; g_st_batch_ns += st_now() - t0; pthread_mutex_unlock(&g_st_mu); }
     if (rc) {
         fprintf(stderr, "[sc-core] flush_batch FALLO rc=%d errno=%d -> conexion cerrada\n", rc, errno);
-        if (t->fd >= 0) { close(t->fd); t->fd = -1; t->hello_done = 0; }
+        conn_drop(t);
         t->last_gl_error = 0x0505;  /* GL_OUT_OF_MEMORY como proxy */
     }
     t->tx_len = 0;
@@ -489,45 +548,25 @@ static int sc_sync_send_impl(struct sc_thread *t) {
     {
         int fdv = t->tx_fd, hf = t->has_tx_fd;
         t->has_tx_fd = 0;
-        rc = sc_send_msg_fds(t->fd, SC_OP_GL_SYNC, t->next_req++, 0,
-                             t->tx, (uint32_t)t->tx_len, hf ? &fdv : NULL, hf ? 1 : 0);
+        rc = shm_send(t, SC_OP_GL_SYNC, t->tx, (uint32_t)t->tx_len, hf ? fdv : -1);
     }
     if (rc) goto fail;
 
-    /* lee header + payload, reusa t->rx creciendo si hace falta */
+    /* respuesta por el ring rsp (spin y luego futex); siempre copia a t->rx */
     struct sc_msg h;
-    /* Primero leer el header con un buffer temporal para conocer h.len. */
-    struct iovec iov = { &h, sizeof h };
-    struct msghdr mh; memset(&mh, 0, sizeof mh);
-    mh.msg_iov = &iov; mh.msg_iovlen = 1;
-    ssize_t r;
-    do { r = recvmsg(t->fd, &mh, MSG_WAITALL); } while (r < 0 && errno == EINTR);
-    if (r == 0) { rc = -ECONNRESET; goto fail; }
-    if (r < 0) { rc = (errno == EAGAIN || errno == EWOULDBLOCK) ? -ETIMEDOUT : -errno; goto fail; }
-    if ((size_t)r != sizeof h) { rc = -EPROTO; goto fail; }
-    if (h.magic != SC_MAGIC || h.len > SC_MAX_PAYLOAD) { rc = -EPROTO; goto fail; }
+    const uint8_t *rp; uint64_t rel;
+    rc = sc_ring_recv(&t->rxr, &h, &rp, &rel, &t->rx, &t->rx_cap, 0,
+                      SC_MAX_PAYLOAD, &t->wrx);
+    if (rc) goto fail;
 
     if (h.op == SC_OP_ERROR) {
-        /* leer payload de error y consumirlo */
+        /* El payload ya quedó copiado en t->rx y el ring sigue sincronizado.
+         * NO cerrar la conexion: el daemon perderia el contexto EGL actual del hilo. */
         uint8_t ebuf[256]; memset(ebuf, 0, sizeof ebuf);
-        uint32_t take = h.len < sizeof ebuf ? h.len : (uint32_t)sizeof ebuf;
-        if (h.len) {
-            int r2 = sc_read_all(t->fd, ebuf, take);
-            if (r2) { rc = r2; goto fail; }
-            if (h.len > take) {
-                uint8_t sink[512];
-                uint32_t rest = h.len - take;
-                while (rest) {
-                    uint32_t k = rest < sizeof sink ? rest : (uint32_t)sizeof sink;
-                    if (sc_read_all(t->fd, sink, k)) break;
-                    rest -= k;
-                }
-            }
-        }
+        size_t take = h.len < sizeof ebuf ? h.len : sizeof ebuf;
+        if (take && t->rx) memcpy(ebuf, t->rx, take);
         fprintf(stderr, "[sc-core] daemon respondio SC_OP_ERROR len=%u first8=%02x%02x%02x%02x%02x%02x%02x%02x (conexion se mantiene)\n",
                 (unsigned)h.len, ebuf[0],ebuf[1],ebuf[2],ebuf[3],ebuf[4],ebuf[5],ebuf[6],ebuf[7]);
-        /* El payload de error ya fue consumido completo: el stream sigue sincronizado.
-         * NO cerrar la conexion: el daemon perderia el contexto EGL actual del hilo. */
         t->last_gl_error = 0x0502;  /* GL_INVALID_OPERATION */
         t->rx_len = 0;
         t->mode = SC_MODE_IDLE;
@@ -535,15 +574,6 @@ static int sc_sync_send_impl(struct sc_thread *t) {
     }
     if (h.op != SC_OP_GL_SYNC) { rc = -EPROTO; goto fail; }
 
-    if (t->rx_cap < h.len) {
-        uint8_t *np = realloc(t->rx, h.len ? h.len : 1);
-        if (!np) { rc = -ENOMEM; goto fail; }
-        t->rx = np; t->rx_cap = h.len;
-    }
-    if (h.len) {
-        int r2 = sc_read_all(t->fd, t->rx, h.len);
-        if (r2) { rc = r2; goto fail; }
-    }
     t->rx_len = h.len;
     t->rx_msg_len = h.len;
     t->mode = SC_MODE_IDLE;
@@ -551,7 +581,7 @@ static int sc_sync_send_impl(struct sc_thread *t) {
 
 fail:
     fprintf(stderr, "[sc-core] sync_send FALLO rc=%d errno=%d -> conexion cerrada, el proximo uso reconecta SIN contexto\n", rc, errno);
-    if (t->fd >= 0) { close(t->fd); t->fd = -1; t->hello_done = 0; }
+    conn_drop(t);
     t->mode = SC_MODE_IDLE;
     t->last_gl_error = 0x0505;
     return rc;
