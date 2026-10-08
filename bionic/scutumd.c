@@ -1287,7 +1287,7 @@ static int32_t exec_gl_one(uint32_t op, struct rd *r, struct wr *w) {
     case SC_GL_glGetInteger64v: {
         ARG_U32(r,u0); GLint64 tmp[16] = {0};
         ((void(*)(GLenum,GLint64*))p_glGetInteger64v)(u0,tmp);
-        if (w) { wr_u32(w,16); for (int i=0;i<16;i++) wr_u64(w,(uint64_t)tmp[i]); }
+        if (w) { uint32_t n=sc_getv_count((GLenum)u0); if (n>16) n=16; wr_u32(w,n); for (uint32_t i=0;i<n;i++) wr_u64(w,(uint64_t)tmp[i]); }
         return 0;
     }
     case SC_GL_glGetSynciv: {
