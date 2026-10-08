@@ -2,7 +2,7 @@
 
 **Hardware-accelerated OpenGL ES for glibc Linux apps running inside a container on Android — by bridging them to the phone's real GPU driver.**
 
-![License](https://img.shields.io/badge/license-MIT-blue)
+![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 ![Arch](https://img.shields.io/badge/arch-aarch64-informational)
 ![Protocol](https://img.shields.io/badge/protocol-v2-success)
 ![Language](https://img.shields.io/badge/language-C-lightgrey)
@@ -146,7 +146,7 @@ Real mobile drivers and real-world apps disagree in ways that need active mediat
 ```
 Scutum/
 ├── Makefile                 # top-level build driver
-├── LICENSE                  # MIT
+├── LICENSE                  # GPL-3.0
 ├── glibc/                   # ── container side ──
 │   ├── sc_egl.c             #   EGL shim + X11/xcb presentation
 │   ├── sc_gles.c            #   GLES 2.0–3.2 shim
@@ -294,4 +294,4 @@ These are documented in the source and not yet resolved:
 
 ## License
 
-Released under the [MIT License](LICENSE) — © 2026 LexusYTG.
+Released under the **GNU General Public License v3.0** — © 2026 LexusYTG. See [LICENSE](LICENSE).
